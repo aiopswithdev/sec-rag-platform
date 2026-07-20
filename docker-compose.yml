@@ -1,0 +1,14 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: production_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+      - ./qdrant_config.yaml:/qdrant/config/production.yaml
+    environment:
+      # This pulls the value securely from the .env file we just created
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}

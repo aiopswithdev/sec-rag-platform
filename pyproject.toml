@@ -1,0 +1,23 @@
+[project]
+name = "sec-rag-platform"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "fastapi>=0.139.2",
+    "fastembed>=0.8.0",
+    "groq>=1.5.0",
+    "httpx>=0.28.1",
+    "langchain-text-splitters>=1.1.2",
+    "langgraph>=1.2.9",
+    "lxml>=6.1.1",
+    "nltk>=3.10.0",
+    "pandas>=3.0.3",
+    "pydantic-settings>=2.14.2",
+    "qdrant-client>=1.18.0",
+    "ragas>=0.4.3",
+    "sec-edgar-downloader>=5.1.0",
+    "uvicorn>=0.51.0",
+]

@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Secrets and local runtime artifacts
+*.pem
+*.key
+*.crt
+*.db
+*.sqlite
+*.sqlite3
+parent_docstore.db
+qdrant_storage/
+data/
+
+# IDE / OS clutter
+.vscode/
+.idea/
+.DS_Store
