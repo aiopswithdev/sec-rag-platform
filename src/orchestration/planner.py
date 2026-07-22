@@ -48,20 +48,29 @@ def plan_queries(state: dict) -> dict:
         "- 'Item 1A' (Risk Factors): Contains qualitative business and market risks. No financial tables.\n"
         "- 'Item 7' (MD&A): Contains narrative explanations of financial results, year-over-year changes, segment performance, and macro factors (like currency fluctuations).\n"
         "- 'Item 8' (Financial Statements): Contains the raw, audited numerical tables (income statements, balance sheets).\n\n"
-        "### STRICT INVENTORY RULE\n"
-        "You must ONLY generate sub-queries matching the available data below:\n"
+        "### STRICT TUPLE INVENTORY RULE\n"
+        "You must ONLY generate a sub-query if BOTH the ticker AND the fiscal_year exist together in the available data below:\n"
         f"{inventory_str}\n\n"
+        "CRITICAL SUB-QUERY RULES:\n"
+        "1. ISOLATED TICKER QUERIES: Each sub-query string MUST target ONLY its designated ticker. "
+        "NEVER mention other company names in a sub-query string (e.g., use 'AAPL segment net sales Americas Europe Greater China', "
+        "NOT 'geographic segment performance for Apple and Microsoft').\n"
+        "2. GEOGRAPHIC DISCLOSURES: When asking for geographic performance, include explicit regional terms in the query string "
+        "(e.g., 'Americas Europe Greater China Japan United States segment net sales revenue').\n"
+        "3. TUPLE INVENTORY: If a ticker or year is NOT in the inventory, return an empty array: {\"sub_queries\": []}.\n"
         "### DECOMPOSITION RULES\n"
         "1. DO NOT over-fragment. If a user asks for multiple regions' sales in a single year, keep it as ONE sub-query.\n"
         "2. If a query requires both numbers (Item 8/Item 7) and explanations (Item 7), generate a single sub-query targeting Item 7, as MD&A contains both.\n"
         "3. Ensure the 'query' field retains the FULL context of what the user is asking (e.g., include the requirement to explain currency impacts)."
+        "4. SEARCH EXPANSION: If querying for specific accounting metrics (e.g., 'effective tax rate'), "
+        "append standard SEC synonyms to the sub-query string (e.g., 'effective tax rate provision for income taxes')."
     )
 
     client = instructor.from_groq(Groq())
     
     try:
         plan: QueryPlan = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             response_model=QueryPlan,
             max_retries=2,
             messages=[

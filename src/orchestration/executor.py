@@ -24,12 +24,20 @@ async def _fetch_single_retrieval(client: httpx.AsyncClient, payload: dict, sema
 
 async def execute_retrieval(state: dict) -> dict:
     """Executor Node: Issues HTTP requests to /retrieve and merges context blocks."""
-    sub_queries = state["sub_queries"]
+    sub_queries = state.get("sub_queries", [])
+    if not sub_queries:
+        return {"retrieved_contexts": [], "retrieval_errors": []}
+
     semaphore = asyncio.Semaphore(2)  # Bound concurrent HTTP execution
     
     retrieved_contexts: List[Dict[str, Any]] = []
     retrieval_errors: List[str] = []
     seen_parent_ids = set()
+
+    # Dynamically scale down the retrieval net for multi-hop queries to prevent Token Guard truncation
+    is_multi_hop = len(sub_queries) > 1
+    base_top_k_parents = 2 if is_multi_hop else 3
+    table_top_k_parents = 3 if is_multi_hop else 5
 
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     async with httpx.AsyncClient(limits=limits) as client:
@@ -38,33 +46,38 @@ async def execute_retrieval(state: dict) -> dict:
         for sq in sub_queries:
             mode = sq.get("retrieval_mode", "HYBRID")
             
-            base_payload = {
+            common_params = {
                 "query": sq["query"],
                 "ticker": sq.get("ticker"),
                 "fiscal_year": sq.get("fiscal_year"),
                 "item_number": sq.get("item_number"),
-                "top_k_chunks": 20,
-                "top_k_parents": 3
             }
             
+            # Helper generators to enforce dynamic scaling across ALL modes
+            def make_table_payload():
+                return {
+                    **common_params,
+                    "table_only": True,
+                    "top_k_chunks": 30,  # Deep footnote table search expansion
+                    "top_k_parents": table_top_k_parents
+                }
+
+            def make_prose_payload():
+                return {
+                    **common_params,
+                    "table_only": False,
+                    "top_k_chunks": 20,
+                    "top_k_parents": base_top_k_parents
+                }
+
             if mode == "TABLE":
-                p = base_payload.copy()
-                p["table_only"] = True
-                tasks.append(_fetch_single_retrieval(client, p, semaphore))
+                tasks.append(_fetch_single_retrieval(client, make_table_payload(), semaphore))
             elif mode == "PROSE":
-                p = base_payload.copy()
-                p["table_only"] = False
-                tasks.append(_fetch_single_retrieval(client, p, semaphore))
+                tasks.append(_fetch_single_retrieval(client, make_prose_payload(), semaphore))
             elif mode == "HYBRID":
-                # Execute TWO parallel requests (one table, one prose) and merge
-                p_table = base_payload.copy()
-                p_table["table_only"] = True
-                
-                p_prose = base_payload.copy()
-                p_prose["table_only"] = False
-                
-                tasks.append(_fetch_single_retrieval(client, p_table, semaphore))
-                tasks.append(_fetch_single_retrieval(client, p_prose, semaphore))
+                # Execute TWO parallel requests (one table, one prose) with correct limits
+                tasks.append(_fetch_single_retrieval(client, make_table_payload(), semaphore))
+                tasks.append(_fetch_single_retrieval(client, make_prose_payload(), semaphore))
 
         results = await asyncio.gather(*tasks)
 

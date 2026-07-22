@@ -8,9 +8,11 @@ logger = logging.getLogger("RouterNode")
 
 class RoutingDecision(BaseModel):
     retrieval_mode: Literal["PROSE", "TABLE", "HYBRID"] = Field(
-        description="'TABLE' for exact financial statement metrics/numbers. 'PROSE' for qualitative commentary/risk disclosures. 'HYBRID' for questions requiring both."
+        description="'TABLE' for exact financial metrics. 'PROSE' for qualitative text. 'HYBRID' for both."
     )
-    reasoning: str = Field(description="Brief justification for the chosen retrieval mode.")
+    reasoning: str = Field(
+        description="Brief justification. CRITICAL: DO NOT use double quotes (\") inside this string; use single quotes only."
+    )
 
 def route_sub_queries(state: dict) -> dict:
     """Router Node: Classifies each sub-query into PROSE, TABLE, or HYBRID mode."""
@@ -24,10 +26,14 @@ def route_sub_queries(state: dict) -> dict:
             f"Classify the optimal retrieval mode for this sub-query:\n"
             f"Query: '{sq['query']}'\n"
             f"Target Section: {sq.get('item_number')}\n\n"
+            "STRICT RULES:\n"
+            "1. Item 1A (Risk Factors) or Item 1C (Cybersecurity) queries are ALWAYS 'PROSE'. Never use TABLE or HYBRID for Item 1A.\n"
+            "2. Direct financial statement metrics (e.g., 'net sales', 'effective tax rate', 'balance sheet') are 'TABLE'.\n"
+            "3. Explanations of financial metrics (e.g., 'what drove net sales changes') are 'HYBRID'.\n\n"
             "Examples:\n"
-            "- 'net sales or total revenue numbers' -> TABLE\n"
-            "- 'supply chain risk disclosures or legal proceedings' -> PROSE\n"
-            "- 'what factors drove the change in operating margin' -> HYBRID"
+            "- 'cybersecurity risk factors or business risks' -> PROSE\n"
+            "- 'effective tax rate or total revenue' -> TABLE\n"
+            "- 'segment net sales AND reasons for growth' -> HYBRID"
         )
         
         try:

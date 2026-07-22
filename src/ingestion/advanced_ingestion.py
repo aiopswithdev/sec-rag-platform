@@ -119,12 +119,13 @@ def extract_fiscal_year(raw_html: str, accession_num: str = "") -> int:
 # ---------------------------------------------------------------------------
 def process_table(ticker, item_name, table_html):
     from io import StringIO
+
     try:
         df_list = pd.read_html(StringIO(table_html))
         if not df_list:
             return False, ""
         df = df_list[0]
-        df = df.dropna(how='all').dropna(axis=1, how='all')
+        df = df.dropna(how="all").dropna(axis=1, how="all")
         if df.shape[0] < 2 or df.shape[1] < 2:
             return False, ""
 
@@ -136,21 +137,43 @@ def process_table(ticker, item_name, table_html):
                 break
 
         if row_labels:
-            return True, f"Financial Table for {ticker} in {item_name}. Rows: {', '.join(row_labels)}."
-        
-        cols = list(df.columns.astype(str))
-        if not all(col.isdigit() for col in cols):
-            summary = f"Financial Table for {ticker} in {item_name}. Columns: {', '.join(cols[:8])}."
-            first_row = df.iloc[0].tolist() if len(df) > 0 else []
-            if first_row:
-                summary += f" Sample row: {', '.join(str(v) for v in first_row[:8])}."
+            summary = f"Financial Table for {ticker} in {item_name}. Rows: {', '.join(row_labels)}."
         else:
-            flat_values = []
-            for row_idx in range(min(2, df.shape[0])):
-                flat_values.extend(df.iloc[row_idx].dropna().tolist()[:4])
-            sample = ", ".join(str(v) for v in flat_values[:8])
-            summary = f"Financial Table for {ticker} in {item_name}. Sample values: {sample}."
+            cols = list(df.columns.astype(str))
+            if not all(col.isdigit() for col in cols):
+                summary = f"Financial Table for {ticker} in {item_name}. Columns: {', '.join(cols[:8])}."
+                first_row = df.iloc[0].tolist() if len(df) > 0 else []
+                if first_row:
+                    summary += (
+                        f" Sample row: {', '.join(str(v) for v in first_row[:8])}."
+                    )
+            else:
+                flat_values = []
+                for row_idx in range(min(2, df.shape[0])):
+                    flat_values.extend(df.iloc[row_idx].dropna().tolist()[:4])
+                sample = ", ".join(str(v) for v in flat_values[:8])
+                summary = f"Financial Table for {ticker} in {item_name}. Sample values: {sample}."
+
+        # =========================================================================
+        # FIX 3: Enriched Footnote Table Summarization
+        # Scan entire table for critical financial concepts beyond top 8 rows
+        # =========================================================================
+        full_table_text = df.to_string().lower()
+        key_terms = [
+            "effective tax rate",
+            "provision for income taxes",
+            "operating lease",
+            "retained earnings",
+        ]
+        found_terms = [term for term in key_terms if term in full_table_text]
+
+        if found_terms:
+            summary += (
+                f" Key financial disclosures present: {', '.join(found_terms)}."
+            )
+
         return True, summary.strip()
+
     except Exception:
         return False, ""
 
