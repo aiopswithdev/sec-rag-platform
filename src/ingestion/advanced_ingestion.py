@@ -56,6 +56,11 @@ NAMESPACE_SEC = uuid.uuid5(uuid.NAMESPACE_DNS, "sec.gov")
 def setup_sqlite():
     conn = sqlite3.connect("parent_docstore.db")
     cursor = conn.cursor()
+
+    # Enable WAL mode for high-concurrency read/write operations
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS parent_documents (
             id TEXT PRIMARY KEY,
@@ -446,6 +451,10 @@ def main():
                     if len(points_batch) >= BATCH_SIZE:
                         qdrant_client.upsert(collection_name=collection_name, points=points_batch)
                         points_batch = []
+                # FIX: Explicitly flush remaining prose vectors per SEC Item
+                if points_batch:
+                    qdrant_client.upsert(collection_name=collection_name, points=points_batch)
+                    points_batch = []
 
         except Exception as e:
             logging.error(f"Failed processing {ticker} {accession_num}: {e}", exc_info=True)

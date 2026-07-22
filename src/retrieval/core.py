@@ -7,6 +7,83 @@ from src.retrieval.models import QueryRequest
 COLLECTION_NAME = "advanced_sec_edgar_production"
 logger = logging.getLogger("CoreRetrieval")
 
+def hydrate_windowed_context(unique_parent_hits: list, window_buffer: int = 1000) -> list[dict]:
+    """Hydrates tables fully, but extracts only targeted surrounding windows for prose."""
+    if not unique_parent_hits:
+        return []
+        
+    # Extract IDs safely to prevent empty SQL IN clauses
+    unique_parent_ids = [hit.payload.get("parent_id") for hit, _ in unique_parent_hits if hit.payload.get("parent_id")]
+    if not unique_parent_ids:
+        return []
+        
+    conn = sqlite3.connect("parent_docstore.db")
+    cursor = conn.cursor()
+    
+    # NOTE: PRAGMA journal_mode=WAL is intentionally excluded here. 
+    # It is a persistent setting applied during ingestion. Read threads must not alter it.
+    
+    placeholders = ",".join(["?"] * len(unique_parent_ids))
+    query = f"SELECT id, full_text FROM parent_documents WHERE id IN ({placeholders})"
+    cursor.execute(query, unique_parent_ids)
+    
+    parent_map = {row[0]: row[1] for row in cursor.fetchall()}
+    conn.close()
+
+    hydrated_blocks = []
+
+    for hit, score in unique_parent_hits:
+        payload = hit.payload
+        parent_id = payload.get("parent_id")
+        
+        if not parent_id:
+            continue
+            
+        full_text = parent_map.get(parent_id, "")
+        is_table = payload.get("is_table", False)
+        
+        if is_table:
+            # FIX: JIT Compilation of bloated SEC HTML into clean Markdown
+            import pandas as pd
+            from io import StringIO
+            from bs4 import BeautifulSoup
+            
+            try:
+                # Parse the raw HTML table stored in SQLite
+                df_list = pd.read_html(StringIO(full_text))
+                if df_list:
+                    df = df_list[0].dropna(how='all').dropna(axis=1, how='all')
+                    # Convert to strict Markdown (collapses thousands of HTML tokens to a few hundred)
+                    content = df.to_markdown(index=False)
+                else:
+                    raise ValueError("No table found")
+            except Exception:
+                # Fallback: aggressively strip HTML tags if pandas fails
+                content = BeautifulSoup(full_text, "lxml").get_text(separator=" | ", strip=True)
+        else:
+            # Prose: Find the child chunk inside the parent and expand the window
+            child_text = payload.get("text", "")
+            start_idx = full_text.find(child_text)
+            
+            if start_idx != -1:
+                # Extract surrounding window safely
+                window_start = max(0, start_idx - window_buffer)
+                window_end = min(len(full_text), start_idx + len(child_text) + window_buffer)
+                content = f"...{full_text[window_start:window_end]}..."
+            else:
+                content = child_text
+                
+        hydrated_blocks.append({
+            "parent_id": parent_id,
+            "ticker": payload.get("ticker"),
+            "fiscal_year": payload.get("fiscal_year"),
+            "item_number": payload.get("item_number"),
+            "is_table": is_table,
+            "content": f"[Match Confidence: {score:.2f}]\n{content}"
+        })
+
+    return hydrated_blocks
+
 def hydrate_parents_from_sql(parent_ids: list[str]) -> list[dict]:
     """Fetch unabridged parent documents from SQLite."""
     if not parent_ids:
@@ -97,12 +174,16 @@ async def execute_core_retrieval(request: QueryRequest, infra) -> list[dict]:
     
     scored_hits = sorted(zip(hits, rerank_scores), key=lambda x: x[1], reverse=True)
     
-    unique_parent_ids = []
+    # 5. Extract and Deduplicate by exact Parent IDs (Preserving Tuples)
+    unique_parent_hits = []
+    seen_parents = set()
     for hit, score in scored_hits:
         parent_id = hit.payload.get("parent_id")
-        if parent_id and parent_id not in unique_parent_ids:
-            unique_parent_ids.append(parent_id)
-        if len(unique_parent_ids) >= request.top_k_parents:
+        if parent_id and parent_id not in seen_parents:
+            seen_parents.add(parent_id)
+            unique_parent_hits.append((hit, score))
+        if len(unique_parent_hits) >= request.top_k_parents:
             break
             
-    return await asyncio.to_thread(hydrate_parents_from_sql, unique_parent_ids)
+    # 6. SQL Hydration (Windowed)
+    return await asyncio.to_thread(hydrate_windowed_context, unique_parent_hits)
