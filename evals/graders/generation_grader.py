@@ -3,35 +3,52 @@ from typing import List, Dict
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 logger = logging.getLogger("GenerationGrader")
 
 class FactEvaluation(BaseModel):
-    is_present_in_answer: bool = Field(description="Does the final answer explicitly contain the expected value/claim?")
-    is_grounded_in_context: bool = Field(description="Is the claim strictly derived from the provided retrieved context?")
-    is_correctly_cited: bool = Field(description="Does the answer explicitly cite the expected source item (e.g., Item 7, Item 1A)?")
+    is_present_in_answer: bool = Field(description="Does the final answer explicitly contain the expected value or claim? Must be boolean true or false.")
+    is_grounded_in_context: bool = Field(description="Is the claim strictly supported by the provided context? Must be boolean true or false.")
+    is_correctly_cited: bool = Field(description="Does the answer explicitly cite the expected source item? Must be boolean true or false.")
 
 class AnswerEvaluation(BaseModel):
     evaluations: List[FactEvaluation]
 
+
+# Exponential backoff decorator to gracefully handle temporary HTTP 429 rate limits
+@retry(
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(Exception)
+)
+def _call_judge_with_backoff(client, prompt: str, system_prompt: str):
+    return client.chat.completions.create(
+        model="llama-3.3-70b-versatile",  # 70B has significantly higher TPM limits on Groq than 120B
+        response_model=AnswerEvaluation,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.0
+    )
+
+
 def grade_generation(answer: str, expected_facts: List[Dict], contexts: List[Dict]) -> Dict[str, float]:
-    """Uses a heavy LLM to judge specific claim extraction and citation fidelity."""
+    """Uses an LLM to judge specific claim extraction and citation fidelity."""
     if not expected_facts:
         return {"presence_score": 1.0, "groundedness_score": 1.0, "citation_score": 1.0}
 
-    # client = instructor.from_groq(Groq())
-    # FIX: Use instructor.Mode.JSON to prevent HTTP 400 server-side tool validation crashes
     client = instructor.from_groq(Groq(), mode=instructor.Mode.JSON)
     
-    # Format context for the judge
+    # Format context for the judge (Cap at 2000 chars per context block to keep token payload < 2500)
     context_str = ""
     for idx, ctx in enumerate(contexts):
-        item_str = ctx.get('item_number', '')
+        item_str = str(ctx.get('item_number', ''))
         item_display = item_str if item_str.startswith("Item") else f"Item {item_str}"
         
         context_str += f"--- Source {idx + 1} ({ctx.get('ticker')} FY{ctx.get('fiscal_year')} {item_display}) ---\n"
-        # FIX: Pass the full context block without 1000-character truncation
-        context_str += ctx.get("content", "") + "\n\n"
+        context_str += ctx.get("content", "")[:2000] + "...\n\n"
 
     prompt = (
         f"Evaluate the generated answer against the expected facts.\n\n"
@@ -41,7 +58,7 @@ def grade_generation(answer: str, expected_facts: List[Dict], contexts: List[Dic
     )
     for fact in expected_facts:
         prompt += f"- Claim: {fact['claim']} | Expected Value: {fact['value']} | Expected Source: {fact['source_item']}\n"
-        
+
     system_prompt = (
         "You are an objective, strict scoring system.\n"
         "You MUST evaluate each expected fact and output a JSON object containing an 'evaluations' array.\n"
@@ -51,17 +68,9 @@ def grade_generation(answer: str, expected_facts: List[Dict], contexts: List[Dic
         "- 'is_correctly_cited' (true/false)\n\n"
         "DO NOT output fields like 'expected', 'actual', or 'result'."
     )
+
     try:
-        eval_result: AnswerEvaluation = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            response_model=AnswerEvaluation,
-            max_retries=3,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0
-        )
+        eval_result: AnswerEvaluation = _call_judge_with_backoff(client, prompt, system_prompt)
         
         results = eval_result.evaluations
         if not results:
@@ -74,5 +83,5 @@ def grade_generation(answer: str, expected_facts: List[Dict], contexts: List[Dic
         return {"presence_score": presence, "groundedness_score": grounded, "citation_score": citation}
         
     except Exception as e:
-        logger.error(f"Generation grader failed: {e}")
+        logger.error(f"Generation grader failed after retries: {e}")
         return {"presence_score": 0.0, "groundedness_score": 0.0, "citation_score": 0.0}
