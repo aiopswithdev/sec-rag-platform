@@ -60,7 +60,7 @@ async def retrieve_context(request: QueryRequest):
         logging.error(f"Retrieval Endpoint Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error during context retrieval.")
 
-
+# This endpoint is not using the RetrievedContext model because it returns a synthesized answer rather than raw context chunks.
 @app.post("/ask", response_model=AskResponse)
 async def ask_rag(request: QueryRequest):
     start_time = time.time()

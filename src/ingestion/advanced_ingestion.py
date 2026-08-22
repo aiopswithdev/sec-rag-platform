@@ -195,7 +195,7 @@ def extract_whitelisted_items(html_content: str):
     for table in soup.find_all('table'):
         full_text = table.get_text(' ', strip=True)
         m = heading_re.match(full_text)
-        if m and len(m.group()) < 250:
+        if m and len(m.group()) < 250: # Can remove the 250 check from here as we are already checking in is_heading function
             tables_with_headings[table] = m.group()
 
     table_map = {}
@@ -318,7 +318,6 @@ def main():
     print(">>> [2/5] Connecting to Qdrant...")
     api_key = os.getenv("QDRANT_API_KEY")
     
-    # Standardized to HTTP port 6333 to match the API service layer
     qdrant_client = QdrantClient(
         host="localhost", 
         port=6334, 
