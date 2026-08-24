@@ -57,8 +57,8 @@ def hydrate_windowed_context(unique_parent_hits: list, window_buffer: int = 1000
                     content = df.to_markdown(index=False)
                 else:
                     raise ValueError("No table found")
-            except Exception:
-                # Fallback: aggressively strip HTML tags if pandas fails
+            except Exception as e:
+                logger.warning(f"Table→markdown failed for {parent_id}, using text fallback: {e}")
                 content = BeautifulSoup(full_text, "lxml").get_text(separator=" | ", strip=True)
         else:
             # Prose: Find the child chunk inside the parent and expand the window
@@ -75,50 +75,15 @@ def hydrate_windowed_context(unique_parent_hits: list, window_buffer: int = 1000
                 
         hydrated_blocks.append({
             "parent_id": parent_id,
-            "ticker": payload.get("ticker"),
-            "fiscal_year": payload.get("fiscal_year"),
-            "item_number": payload.get("item_number"),
+            "ticker": payload.get("ticker", "UNKNOWN"),       # <-- Safe default
+            "fiscal_year": payload.get("fiscal_year", 0),     # <-- Safe default
+            "item_number": payload.get("item_number", "UNKNOWN"), # <-- Safe default
             "is_table": is_table,
+            "score": float(score),  # <-- First-class field
             "content": f"[Match Confidence: {score:.2f}]\n{content}"
         })
 
     return hydrated_blocks
-
-def hydrate_parents_from_sql(parent_ids: list[str]) -> list[dict]:
-    """Fetch unabridged parent documents from SQLite."""
-    if not parent_ids:
-        return []
-    
-    conn = sqlite3.connect("parent_docstore.db")
-    cursor = conn.cursor()
-    
-    # Staff-Level Realtime Harden: Force Write-Ahead Logging to prevent lockups on orchestrator gather
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    
-    placeholders = ",".join(["?"] * len(parent_ids))
-    query = f"SELECT id, ticker, fiscal_year, item_number, is_table, full_text FROM parent_documents WHERE id IN ({placeholders})"
-    
-    cursor.execute(query, parent_ids)
-    rows = cursor.fetchall()
-    conn.close()
-    
-    fetched_ids = {row[0] for row in rows}
-    missing_ids = set(parent_ids) - fetched_ids
-    if missing_ids:
-        logger.warning(f"Data Integrity Warning: Parent IDs missing in SQLite: {missing_ids}")
-    
-    hydrated = []
-    for row in rows:
-        hydrated.append({
-            "parent_id": row[0],
-            "ticker": row[1],
-            "fiscal_year": row[2],
-            "item_number": row[3],
-            "is_table": bool(row[4]),
-            "content": row[5]
-        })
-    return hydrated
-
 
 async def execute_core_retrieval(request: QueryRequest, infra) -> list[dict]:
     """Encapsulates the isolated hybrid search, reranking, and SQL hydration pipeline."""

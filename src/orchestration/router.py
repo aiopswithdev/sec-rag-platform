@@ -3,6 +3,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
+import asyncio
+from groq import AsyncGroq
 
 logger = logging.getLogger("RouterNode")
 
@@ -14,15 +16,7 @@ class RoutingDecision(BaseModel):
         description="Brief justification. CRITICAL: NEVER use double quotes (\") inside this string; use single quotes (') only."
     )
 
-async def route_sub_queries(state: dict) -> dict:
-    """Router Node: Classifies each sub-query into PROSE, TABLE, or HYBRID retrieval modes."""
-    sub_queries = state.get("sub_queries", [])
-    if not sub_queries:
-        return {"sub_queries": []}
-
-    client = instructor.from_groq(Groq(), mode=instructor.Mode.TOOLS)
-    
-    system_prompt = (
+system_prompt = (
         "You are a strict SEC 10-K query router. Classify the query into 'PROSE', 'TABLE', or 'HYBRID'.\n\n"
         "CRITICAL FORMATTING RULE:\n"
         "Do NOT use double quotes (\") inside the reasoning field. Use single quotes (') only.\n\n"
@@ -37,27 +31,30 @@ async def route_sub_queries(state: dict) -> dict:
         "- 'geographic segment net sales and reasons for growth' -> HYBRID"
     )
 
-    updated_sub_queries = []
-    for sq in sub_queries:
-        user_prompt = f"Sub-Query: '{sq['query']}' | Target Section: {sq.get('item_number', 'UNKNOWN')}"
-        try:
-            decision: RoutingDecision = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                response_model=RoutingDecision,
-                max_retries=2,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0
-            )
-            sq_copy = sq.copy()
-            sq_copy["retrieval_mode"] = decision.retrieval_mode
-            updated_sub_queries.append(sq_copy)
-        except Exception as e:
-            logger.error(f"Router failed for sub-query '{sq['query']}': {e}")
-            sq_copy = sq.copy()
-            sq_copy["retrieval_mode"] = "HYBRID"  # Safe default fallback
-            updated_sub_queries.append(sq_copy)
+_router_client = instructor.from_groq(AsyncGroq(), mode=instructor.Mode.JSON)  # module-level
 
-    return {"sub_queries": updated_sub_queries}
+async def _route_one(sq: dict, sem: asyncio.Semaphore) -> dict:
+    sq_copy = sq.copy()
+    async with sem:
+        try:
+            decision = await _router_client.chat.completions.create(
+                model="openai/gpt-oss-20b", response_model=RoutingDecision,
+                max_retries=2, temperature=0.0,
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": f"Sub-Query: '{sq['query']}' | Target Section: {sq.get('item_number', 'UNKNOWN')}"}],
+            )
+            sq_copy["retrieval_mode"] = decision.retrieval_mode
+        except Exception as e:
+            logger.error(f"Router failed for '{sq['query']}': {e}")
+            sq_copy["retrieval_mode"] = "HYBRID"
+    return sq_copy
+
+async def route_sub_queries(state: dict) -> dict:
+    """Router Node: Classifies each sub-query into PROSE, TABLE, or HYBRID retrieval modes."""
+    sub_queries = state.get("sub_queries", [])
+    if not sub_queries:
+        return {"sub_queries": []}
+
+    sem = asyncio.Semaphore(4)
+    updated_sub_queries = await asyncio.gather(*(_route_one(sq, sem) for sq in sub_queries))
+    return {"sub_queries": list(updated_sub_queries)}

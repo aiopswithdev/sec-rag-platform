@@ -9,7 +9,6 @@ class SubQuery(TypedDict):
 
 class AgentState(TypedDict):
     raw_query: str
-    available_inventory: List[Dict[str, Any]]
     sub_queries: List[SubQuery]
     retrieved_contexts: List[Dict[str, Any]]
     retrieval_errors: List[str]

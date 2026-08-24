@@ -24,7 +24,7 @@ class AnswerEvaluation(BaseModel):
 )
 def _call_judge_with_backoff(client, prompt: str, system_prompt: str):
     return client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # 70B has significantly higher TPM limits on Groq than 120B
+        model="openai/gpt-oss-120b",  # 70B has significantly higher TPM limits on Groq than 120B
         response_model=AnswerEvaluation,
         messages=[
             {"role": "system", "content": system_prompt},

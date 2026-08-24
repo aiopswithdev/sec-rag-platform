@@ -1,16 +1,20 @@
 import os
+import json
 import time
+import uuid
+import asyncio
 import logging
-import tiktoken
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from qdrant_client import AsyncQdrantClient
 from fastembed import TextEmbedding, SparseTextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from groq import AsyncGroq
 
-from src.retrieval.models import QueryRequest, RetrievedContext, AskResponse
+from src.retrieval.models import QueryRequest, RetrievedContext, AskRequest, OrchestratedAskResponse
 from src.retrieval.core import execute_core_retrieval
+from src.orchestration.graph import orchestrator_app
 
 try:
     from dotenv import load_dotenv
@@ -51,6 +55,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+ASK_TIMEOUT = float(os.getenv("ASK_TIMEOUT", "180"))
+_ask_gate = asyncio.Semaphore(int(os.getenv("ASK_MAX_CONCURRENCY", "4")))
+
+async def _local_retriever(payload: dict) -> list[dict]:
+    """Adapter: executor payload dict -> in-process core retrieval."""
+    return await execute_core_retrieval(QueryRequest(**payload), infra)
 
 @app.post("/retrieve", response_model=list[RetrievedContext])
 async def retrieve_context(request: QueryRequest):
@@ -60,117 +70,68 @@ async def retrieve_context(request: QueryRequest):
         logging.error(f"Retrieval Endpoint Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error during context retrieval.")
 
-# This endpoint is not using the RetrievedContext model because it returns a synthesized answer rather than raw context chunks.
-@app.post("/ask", response_model=AskResponse)
-async def ask_rag(request: QueryRequest):
-    start_time = time.time()
-    
-    retrieval_start = time.time()
-    try:
-        retrieved_parents = await execute_core_retrieval(request, infra)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database retrieval failed: {str(e)}")
-    retrieval_latency = time.time() - retrieval_start
+@app.post("/ask", response_model=OrchestratedAskResponse)
+async def ask_orchestrated(request: AskRequest):
+    started = time.perf_counter()
+    trace_id = str(uuid.uuid4())
 
-    if not retrieved_parents:
-        return AskResponse(
-            query=request.query,
-            answer="I do not have sufficient data in the retrieved filings to answer this.",
-            sources=[],
-            telemetry={
-                "total_pipeline_latency_seconds": round(time.time() - start_time, 3),
-                "retrieval_latency_seconds": round(retrieval_latency, 3),
-                "source_count": 0
-            }
-        )
+    async with _ask_gate:
+        try:
+            final_state = await asyncio.wait_for(
+                orchestrator_app.ainvoke(
+                    {"raw_query": request.query},
+                    config={"configurable": {"retriever": _local_retriever},
+                            "run_id": trace_id},
+                ),
+                timeout=ASK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(504, f"Orchestration exceeded {ASK_TIMEOUT}s")
+        except Exception as e:
+            logging.exception("Orchestration failure")
+            raise HTTPException(502, f"Orchestration failed: {e}")
 
-    encoder = tiktoken.get_encoding("cl100k_base")
-    TOKEN_CEILING = 8000 
-    context_blocks = []
-    sources = []
-    total_tokens = 0
-    truncated = False
-
-    for parent in retrieved_parents:
-        header = f"--- Document: {parent['ticker']} (FY {parent['fiscal_year']} - {parent['item_number']}) ---\n"
-        full_text = parent['content']
-        header_tokens = len(encoder.encode(header))
-        available_tokens = TOKEN_CEILING - total_tokens - header_tokens - 500
-        
-        if available_tokens <= 0:
-            break
-
-        parent_token_ids = encoder.encode(full_text)
-        
-        if len(parent_token_ids) > available_tokens:
-            truncated = True
-            truncated_text = encoder.decode(parent_token_ids[:available_tokens])
-            last_period = truncated_text.rfind('. ')
-            if last_period > len(truncated_text) // 2:
-                truncated_text = truncated_text[:last_period+1]
-                
-            truncated_text += "\n\n[...TRUNCATED DUE TO CONTEXT LIMIT...]"
-            added_tokens = len(encoder.encode(truncated_text))
-        else:
-            truncated_text = full_text
-            added_tokens = len(parent_token_ids)
-
-        block = header + truncated_text + "\n"
-        context_blocks.append(block)
-        
-        sources.append({
-            "ticker": parent["ticker"], 
-            "fiscal_year": parent["fiscal_year"],
-            "item_number": parent["item_number"],
-            "parent_id": parent["parent_id"],
-            "is_table": parent["is_table"]
-        })
-        
-        total_tokens += (header_tokens + added_tokens)
-        if truncated:
-            break
-            
-    compiled_context = "\n".join(context_blocks)
-
-    system_prompt = (
-        "You are a strict financial analyst AI. Answer the user's question using ONLY the provided SEC 10-K context.\n\n"
-        "RULES:\n"
-        "1. If the context does not contain the specific metric or fact requested after thorough examination, "
-        "state: 'I do not have sufficient data in the retrieved filings to answer this.'\n"
-        "2. DO NOT invent facts or external data. However, you MAY group related risk concepts if explicitly mentioned.\n"
-        "3. You MUST cite the source for every fact or metric: e.g., 'AAPL FY 2024 - Item 1A'.\n"
-        "4. If the context includes HTML tables, extract the relevant data and present it in clean markdown tables.\n"
-        "5. When the context contains multiple documents, compare them explicitly.\n"
-        "6. Before concluding, examine both prose and tables."
-    )
-    
-    if truncated:
-        system_prompt += "\nNOTE: Context was truncated for safety. Answer as best as you can with the provided fragment."
-
-    try:
-        response = await infra.llm_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{compiled_context}\n\nQuestion: {request.query}"}
-            ]
-        )
-        answer = response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"LLM Generation Error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"LLM Generation failed: {str(e)}")
-
-    return AskResponse(
+    node_telemetry = final_state.get("telemetry", {}) or {}
+    return OrchestratedAskResponse(
         query=request.query,
-        answer=answer,
-        sources=sources,
+        answer=final_state.get("final_answer", ""),
+        sources=final_state.get("sources", []),
+        sub_queries=final_state.get("sub_queries", []),
+        retrieval_errors=final_state.get("retrieval_errors", []),
         telemetry={
-            "total_pipeline_latency_seconds": round(time.time() - start_time, 3),
-            "retrieval_latency_seconds": round(retrieval_latency, 3),
-            "source_count": len(sources)
-        }
+            **node_telemetry,
+            "trace_id": trace_id,
+            "total_latency_seconds": round(time.perf_counter() - started, 3),
+            "sub_query_count": len(final_state.get("sub_queries", [])),
+            "context_block_count": len(final_state.get("retrieved_contexts", [])),
+        },
     )
+
+@app.post("/ask/stream")
+async def ask_stream(request: AskRequest):
+    async def gen():
+        async for chunk in orchestrator_app.astream(
+            {"raw_query": request.query},
+            config={"configurable": {"retriever": _local_retriever}},
+        ):
+            for node, update in chunk.items():
+                payload = {"node": node}
+                if node == "planner":   
+                    payload["sub_queries"] = update.get("sub_queries", [])
+                elif node == "router":  
+                    payload["routes"] = [{"q": s["query"], "mode": s.get("retrieval_mode")} for s in update.get("sub_queries", [])]
+                elif node == "executor":
+                    payload["context_count"] = len(update.get("retrieved_contexts", []))
+                elif node == "synthesis":
+                    payload |= {
+                        "answer": update.get("final_answer"),
+                        "sources": update.get("sources", []),
+                        "telemetry": update.get("telemetry", {})
+                    }
+                yield f"data: {json.dumps(payload)}\n\n"
+        yield "data: {\"node\": \"done\"}\n\n"
+        
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 if __name__ == "__main__":
     import uvicorn

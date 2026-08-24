@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import sys
 from dotenv import load_dotenv
+from fastapi import logger
 
 # Load environment variables from .env before importing orchestration code
 load_dotenv()
@@ -58,7 +60,8 @@ async def run_sanity_check():
                     print(json.dumps(state_update.get("telemetry"), indent=2))
                     
     except Exception as e:
-        print(f"\n[X] Orchestration failed: {e}")
+        logger.error(f"Pipeline failed: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(run_sanity_check())

@@ -6,6 +6,9 @@ from groq import Groq
 
 logger = logging.getLogger("SynthesisNode")
 
+# HOISTED: Module-level client reuses the HTTP connection pool across all synthesis node executions
+_synthesis_client = Groq()
+
 def synthesize_answer(state: dict) -> dict:
     """
     Synthesis Node: Consumes raw contexts, applies per-entity balanced token allocation
@@ -50,11 +53,15 @@ def synthesize_answer(state: dict) -> dict:
     for ticker in unique_tickers:
         entity_contexts = grouped_contexts[ticker]
         
-        # Separate table vs prose contexts
+        # 1. Separate table vs prose contexts
         tables = [c for c in entity_contexts if c.get("is_table", False)]
         prose = [c for c in entity_contexts if not c.get("is_table", False)]
+
+        # 2. Sort both buckets by highest relevance score first
+        tables.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        prose.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         
-        # Build diet-ordered contexts: Guarantee 1 Table + up to 2 Prose blocks first
+        # 3. Build diet-ordered contexts: Guarantee top table + top 2 prose blocks first
         diet_ordered_contexts = []
         
         if tables:
@@ -64,15 +71,14 @@ def synthesize_answer(state: dict) -> dict:
             if prose:
                 diet_ordered_contexts.append(prose.pop(0))
                 
-        # Append remaining tables and prose for greedy fill
+        # 4. Append remaining tables and prose (already score-sorted) for greedy fill
         diet_ordered_contexts.extend(tables)
         diet_ordered_contexts.extend(prose)
         
         entity_tokens = 0
 
         for parent in diet_ordered_contexts:
-            raw_item = str(parent.get("item_number", ""))
-            item_str = raw_item if raw_item.startswith("Item") else f"Item {raw_item}"
+            item_str = str(parent.get("item_number", "UNKNOWN"))
             header = f"--- Document: {parent['ticker']} (FY {parent['fiscal_year']} - {item_str}) ---\n"
             full_text = parent.get("content", "")
             
@@ -140,9 +146,8 @@ def synthesize_answer(state: dict) -> dict:
     if any_truncated:
         system_prompt += "\nNOTE: Context was truncated for safety. Answer as best as you can with the provided fragment."
 
-    llm_client = Groq()
     try:
-        response = llm_client.chat.completions.create(
+        response = _synthesis_client.chat.completions.create(
             model="openai/gpt-oss-120b",
             temperature=0.0,
             messages=[
@@ -159,7 +164,7 @@ def synthesize_answer(state: dict) -> dict:
         "final_answer": answer,
         "sources": sources,
         "telemetry": {
-            "total_latency_seconds": round(time.time() - start_time, 3),
+            "synthesis_latency_seconds": round(time.time() - start_time, 3),
             "source_count": len(sources),
             "retrieval_errors_count": len(errors)
         }

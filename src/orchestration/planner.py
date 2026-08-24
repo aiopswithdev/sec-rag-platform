@@ -1,11 +1,16 @@
+import os
 import sqlite3
 import logging
-from typing import List, Optional, Literal
+from functools import lru_cache
+from typing import List, Optional, Literal, Set, Tuple
 from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
 
 logger = logging.getLogger("PlannerNode")
+
+# HOISTED: Module-level client reuses the connection pool across all planner node executions
+_planner_client = instructor.from_groq(Groq(), mode=instructor.Mode.JSON)
 
 class ExtractedSubQuery(BaseModel):
     query: str = Field(description="Focused search query string.")
@@ -19,6 +24,24 @@ class ExtractedSubQuery(BaseModel):
 class QueryPlan(BaseModel):
     sub_queries: List[ExtractedSubQuery]
 
+# CACHED: SQLite hit only happens once (or until cache is cleared), not per-request
+@lru_cache(maxsize=1)
+def fetch_valid_company_years(db_path: str = "parent_docstore.db") -> Set[Tuple[str, int]]:
+    """Returns a set of valid (ticker, fiscal_year) tuples for O(1) post-validation."""
+    if not os.path.exists(db_path):
+        logger.error(f"Database file not found at path: {db_path}")
+        return set()
+        
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT ticker, fiscal_year FROM parent_documents")
+        rows = cursor.fetchall()
+        conn.close()
+        return {(r[0], r[1]) for r in rows}
+    except Exception as e:
+        logger.error(f"Failed to fetch database inventory: {e}")
+        return set()
 
 def fetch_database_inventory(db_path: str = "parent_docstore.db") -> List[dict]:
     """Queries SQLite for distinct active document metadata tuples."""
@@ -37,9 +60,10 @@ def fetch_database_inventory(db_path: str = "parent_docstore.db") -> List[dict]:
 def plan_queries(state: dict) -> dict:
     """Planner Node: Decomposes raw query against strict database inventory."""
     raw_query = state["raw_query"]
-    inventory = state.get("available_inventory") or fetch_database_inventory()
-    
-    inventory_str = "\n".join([f"- Ticker: {i['ticker']} | Year: {i['fiscal_year']} | Item: {i['item_number']}" for i in inventory])
+    # HARD CHECK: Prevent silent failures if the database is missing or empty
+    valid_inventory = fetch_valid_company_years()
+    if not valid_inventory:
+        raise RuntimeError("Parent docstore inventory is empty — check DOCSTORE_PATH / run ingestion.")
     
     system_prompt = (
     "You are an expert enterprise financial query planner. Your objective is to decompose complex user prompts "
@@ -51,8 +75,6 @@ def plan_queries(state: dict) -> dict:
     "- Item 7 (MD&A): Narrative explanations of results, segment performance, and growth drivers.\n"
     "- Item 8 (Financial Statements & Notes): Audited financial tables (Income Statement, Balance Sheet, Tax & Geographic Footnotes).\n\n"
     "### STRICT TUPLE INVENTORY RULE (NON-NEGOTIABLE)\n"
-    "You MUST ONLY generate a sub-query if BOTH the ticker AND the fiscal_year exist together in the available inventory below:\n"
-    f"{inventory_str}\n\n"
     "CRITICAL SUB-QUERY CONSTRAINTS:\n"
     "1. EMPTY ARRAY FOR MISSING DATA: If a ticker or fiscal year in the prompt is NOT in the inventory above, "
     "return an empty array: {\"sub_queries\": []}. Do not attempt to guess or substitute years.\n"
@@ -119,11 +141,9 @@ def plan_queries(state: dict) -> dict:
     "}"
 )
 
-    client = instructor.from_groq(Groq())
-    
     try:
-        plan: QueryPlan = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        plan: QueryPlan = _planner_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
             response_model=QueryPlan,
             max_retries=2,
             messages=[
@@ -132,19 +152,25 @@ def plan_queries(state: dict) -> dict:
             ],
             temperature=0.0
         )
-        sub_queries = [sq.model_dump() for sq in plan.sub_queries]
+        # --- DETERMINISTIC TUPLE GUARD ---
+        # Post-process validation. If the LLM hallucinates or extracts a ticker/year 
+        # not in our DB, we drop it here deterministically.
+        validated_queries = []
+        for sq in plan.sub_queries:
+            if (sq.ticker, sq.fiscal_year) in valid_inventory:
+                validated_queries.append(sq.model_dump())
+            else:
+                logger.warning(f"Tuple Guard dropped out-of-bounds query: {sq.ticker} FY{sq.fiscal_year}")
+                
+        sub_queries = validated_queries
     except Exception as e:
-        logger.error(f"Planner failed or output invalid schema: {e}")
-        # Fallback to direct raw query with no filters
-        sub_queries = [{
-            "query": raw_query,
-            "ticker": None,
-            "fiscal_year": None,
-            "item_number": None,
-            "retrieval_mode": "HYBRID"
-        }]
+        logger.error(f"Planner failed: {e}")
+        # FAIL CLOSED: Do not bypass the tuple guard on infrastructure failures.
+        return {
+            "sub_queries": [],
+            "retrieval_errors": [f"Planner unavailable: {e}"]
+        }
 
     return {
-        "available_inventory": inventory,
         "sub_queries": sub_queries
     }
