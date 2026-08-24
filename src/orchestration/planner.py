@@ -10,7 +10,7 @@ from groq import Groq
 logger = logging.getLogger("PlannerNode")
 
 # HOISTED: Module-level client reuses the connection pool across all planner node executions
-_planner_client = instructor.from_groq(Groq(), mode=instructor.Mode.JSON)
+_planner_client = instructor.from_groq(Groq(), mode=instructor.Mode.TOOLS)
 
 class ExtractedSubQuery(BaseModel):
     query: str = Field(description="Focused search query string.")

@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 import tiktoken
@@ -6,14 +7,17 @@ from groq import Groq
 
 logger = logging.getLogger("SynthesisNode")
 
-# HOISTED: Module-level client reuses the HTTP connection pool across all synthesis node executions
 _synthesis_client = Groq()
+
+# Conservative token thresholds to guarantee staying well under Groq TPM limits
+TOTAL_TOKEN_CEILING = int(os.getenv("SYNTHESIS_TOKEN_CEILING", "5000"))
+SAFETY_MARGIN = int(os.getenv("SYNTHESIS_SAFETY_MARGIN", "1800"))
+MAX_COMPLETION_TOKENS = int(os.getenv("SYNTHESIS_MAX_COMPLETION_TOKENS", "900"))
 
 def synthesize_answer(state: dict) -> dict:
     """
     Synthesis Node: Consumes raw contexts, applies per-entity balanced token allocation
-    with a hybrid context diet (guaranteeing both tables and prose narrative per entity),
-    and generates the final answer.
+    with a hybrid context diet, and generates the final answer within safe TPM limits.
     """
     start_time = time.time()
     raw_query = state["raw_query"]
@@ -25,13 +29,11 @@ def synthesize_answer(state: dict) -> dict:
         return {
             "final_answer": f"I do not have sufficient data in the retrieved filings to answer this.{err_context}",
             "sources": [],
-            "telemetry": {"latency_seconds": round(time.time() - start_time, 3), "source_count": 0}
+            "telemetry": {"synthesis_latency_seconds": round(time.time() - start_time, 3), "source_count": 0}
         }
 
     # --- Per-Entity Balanced Token Allocation ---
     encoder = tiktoken.get_encoding("cl100k_base")
-    TOTAL_TOKEN_CEILING = 8000
-    SAFETY_MARGIN = 500  # Reserve tokens for system prompt and formatting overhead
     
     # 1. Group contexts by ticker
     grouped_contexts = defaultdict(list)
@@ -42,8 +44,8 @@ def synthesize_answer(state: dict) -> dict:
     unique_tickers = sorted(list(grouped_contexts.keys()))
     num_tickers = max(len(unique_tickers), 1)
 
-    # 2. Divide token budget equally across entities
-    per_entity_ceiling = (TOTAL_TOKEN_CEILING - SAFETY_MARGIN) // num_tickers
+    # 2. Divide token budget equally across entities with safety margins
+    per_entity_ceiling = max((TOTAL_TOKEN_CEILING - SAFETY_MARGIN) // num_tickers, 500)
 
     context_blocks = []
     sources = []
@@ -53,15 +55,15 @@ def synthesize_answer(state: dict) -> dict:
     for ticker in unique_tickers:
         entity_contexts = grouped_contexts[ticker]
         
-        # 1. Separate table vs prose contexts
+        # Separate table vs prose contexts
         tables = [c for c in entity_contexts if c.get("is_table", False)]
         prose = [c for c in entity_contexts if not c.get("is_table", False)]
 
-        # 2. Sort both buckets by highest relevance score first
+        # Sort both buckets by highest relevance score first
         tables.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         prose.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         
-        # 3. Build diet-ordered contexts: Guarantee top table + top 2 prose blocks first
+        # Build diet-ordered contexts: Guarantee top table + top 2 prose blocks first
         diet_ordered_contexts = []
         
         if tables:
@@ -71,7 +73,7 @@ def synthesize_answer(state: dict) -> dict:
             if prose:
                 diet_ordered_contexts.append(prose.pop(0))
                 
-        # 4. Append remaining tables and prose (already score-sorted) for greedy fill
+        # Append remaining tables and prose (already score-sorted) for greedy fill
         diet_ordered_contexts.extend(tables)
         diet_ordered_contexts.extend(prose)
         
@@ -150,6 +152,7 @@ def synthesize_answer(state: dict) -> dict:
         response = _synthesis_client.chat.completions.create(
             model="openai/gpt-oss-120b",
             temperature=0.0,
+            max_tokens=MAX_COMPLETION_TOKENS,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Context:\n{compiled_context}\n\nQuestion: {raw_query}"}

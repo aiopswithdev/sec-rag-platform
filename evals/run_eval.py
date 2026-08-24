@@ -60,7 +60,10 @@ async def evaluate_harness(jsonl_path: str):
     # Boot up the exact same infrastructure used by the live FastAPI server
     dummy_app = FastAPI()
     async with lifespan(dummy_app):
-        for case in queries:
+        for i, case in enumerate(queries):
+            if i > 0:
+                print("\n⏳ Cooldown pacing (5s) to avoid TPM cross-case collisions...")
+                await asyncio.sleep(5)
             print(f"\n" + "=" * 50)
             print(f"🔍 EVALUATING [{case['id']}] ({case['category']})")
             print(f"Query: \"{case['query']}\"")
