@@ -9,7 +9,6 @@ logger = logging.getLogger("ExecutorNode")
 RETRIEVAL_ENDPOINT = os.getenv("RETRIEVAL_API_URL", "http://localhost:8000/retrieve")
 
 async def _fetch_single_retrieval(client: httpx.AsyncClient, payload: dict, semaphore: asyncio.Semaphore) -> tuple[List[dict], str]:
-    """Issues HTTP request to /retrieve endpoint with concurrency bounds."""
     async with semaphore:
         try:
             response = await client.post(RETRIEVAL_ENDPOINT, json=payload, timeout=45.0)
@@ -31,12 +30,12 @@ async def _fetch_local(retriever, payload: dict, sem: asyncio.Semaphore) -> tupl
             msg = f"Local retrieval error for '{payload.get('query')}': {e}"
             logger.error(msg)
             return [], msg
-        
+
 def build_payloads(sub_queries: List[dict]) -> List[dict]:
     payloads = []
     is_multi_hop = len(sub_queries) > 1
     base_top_k_parents = 2 if is_multi_hop else 3
-    table_top_k_parents = 3 if is_multi_hop else 5
+    table_top_k_parents = 5 if is_multi_hop else 5
 
     for sq in sub_queries:
         mode = sq.get("retrieval_mode", "HYBRID")
@@ -48,7 +47,7 @@ def build_payloads(sub_queries: List[dict]) -> List[dict]:
         }
         table_payload = {**common_params, "table_only": True, "top_k_chunks": 30, "top_k_parents": table_top_k_parents}
         prose_payload = {**common_params, "table_only": False, "top_k_chunks": 20, "top_k_parents": base_top_k_parents}
-        
+
         if mode == "TABLE":
             payloads.append(table_payload)
         elif mode == "PROSE":
@@ -56,17 +55,19 @@ def build_payloads(sub_queries: List[dict]) -> List[dict]:
         elif mode == "HYBRID":
             payloads.append(table_payload)
             payloads.append(prose_payload)
-    return payloads        
+    return payloads
 
 async def execute_retrieval(state: dict, config: RunnableConfig | None = None) -> dict:
     """Executor Node: Issues HTTP requests to /retrieve and merges context blocks."""
     sub_queries = state.get("sub_queries", [])
     if not sub_queries:
-        return {"retrieved_contexts": [], "retrieval_errors": []}
+        # Preserve any upstream planner error instead of wiping it — synthesis needs
+        # to know WHY there's no data (planner crash vs. genuine out-of-inventory refusal).
+        return {"retrieved_contexts": [], "retrieval_errors": state.get("retrieval_errors", [])}
 
     retriever = (config or {}).get("configurable", {}).get("retriever")
     sem = asyncio.Semaphore(int(os.getenv("RETRIEVAL_CONCURRENCY", "4")))
-    
+
     payloads = build_payloads(sub_queries)
 
     if retriever is not None:
@@ -78,7 +79,7 @@ async def execute_retrieval(state: dict, config: RunnableConfig | None = None) -
 
     best_contexts_by_parent: Dict[str, Dict[str, Any]] = {}
     retrieval_errors: List[str] = []
-    
+
     for contexts, error in results:
         if error:
             retrieval_errors.append(error)

@@ -13,5 +13,6 @@ class AgentState(TypedDict):
     retrieved_contexts: List[Dict[str, Any]]
     retrieval_errors: List[str]
     final_answer: str
+    compiled_context: str
     sources: List[Dict[str, Any]]
     telemetry: Dict[str, Any]

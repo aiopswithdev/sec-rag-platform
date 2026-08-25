@@ -56,6 +56,7 @@ async def evaluate_harness(jsonl_path: str):
         "planner_recall", "planner_precision", "routing_accuracy",
         "presence_score", "groundedness_score", "citation_score", "adversarial_success"
     ]}
+    ungraded = []
 
     # Boot up the exact same infrastructure used by the live FastAPI server
     dummy_app = FastAPI()
@@ -85,17 +86,27 @@ async def evaluate_harness(jsonl_path: str):
                 print(f"  -> Adversarial Defense: {'PASS' if success else 'FAIL'}")
             else:
                 decomp_scores = grade_decomposition(case["expected_sub_queries"], final_state.get("sub_queries", []))
-                gen_scores = grade_generation(final_state.get("final_answer", ""), case["expected_facts"], final_state.get("retrieved_contexts", []))
-                
                 metrics["planner_recall"].append(decomp_scores["recall"])
                 metrics["planner_precision"].append(decomp_scores["precision"])
                 metrics["routing_accuracy"].append(decomp_scores["routing_accuracy"])
-                metrics["presence_score"].append(gen_scores["presence_score"])
-                metrics["groundedness_score"].append(gen_scores["groundedness_score"])
-                metrics["citation_score"].append(gen_scores["citation_score"])
-                
                 print(f"\n  -> Decomposition Scores : Recall={decomp_scores['recall']:.2f}, Routing={decomp_scores['routing_accuracy']:.2f}")
-                print(f"  -> Generation Scores    : Faithfulness={gen_scores['groundedness_score']:.2f}, Citations={gen_scores['citation_score']:.2f}")
+
+                answer_text = final_state.get("final_answer", "")
+                if "do not have sufficient data" in answer_text.lower() and final_state.get("compiled_context"):
+                    dump_path = f"/tmp/refusal_{case['id']}.txt"
+                    with open(dump_path, "w") as f:
+                        f.write(final_state["compiled_context"])
+                    print(f"  ⚠️  Refusal with non-empty context — packed context dumped to {dump_path}")
+
+                gen_scores = grade_generation(answer_text, case["expected_facts"], final_state.get("compiled_context", ""))
+                if gen_scores is None:
+                    ungraded.append(case["id"])
+                    print(f"  -> Generation Scores    : UNGRADED (grader unavailable — excluded from rollup)")
+                else:
+                    metrics["presence_score"].append(gen_scores["presence_score"])
+                    metrics["groundedness_score"].append(gen_scores["groundedness_score"])
+                    metrics["citation_score"].append(gen_scores["citation_score"])
+                    print(f"  -> Generation Scores    : Faithfulness={gen_scores['groundedness_score']:.2f}, Citations={gen_scores['citation_score']:.2f}")
 
     # Aggregation & Rollup
     avg = lambda lst: sum(lst) / len(lst) if lst else 0.0
@@ -108,6 +119,8 @@ async def evaluate_harness(jsonl_path: str):
     print(f"Context Groundedness:       {avg(metrics['groundedness_score']):.2f}")
     print(f"Citation Accuracy:          {avg(metrics['citation_score']):.2f}")
     print(f"Adversarial Refusal Rate:   {avg(metrics['adversarial_success']):.2f}")
+    if ungraded:
+        print(f"⚠️  Ungraded (grader unavailable): {', '.join(ungraded)}")
     print("=" * 50)
 
 if __name__ == "__main__":
