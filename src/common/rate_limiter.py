@@ -40,3 +40,4 @@ class TPMLimiter:
 
 planner_limiter = TPMLimiter(tpm_budget=int(os.getenv("PLANNER_TPM_BUDGET", "7000")))
 synthesis_limiter = TPMLimiter(tpm_budget=int(os.getenv("SYNTHESIS_TPM_BUDGET", "7000")))
+grader_limiter = TPMLimiter(tpm_budget=int(os.getenv("GRADER_TPM_BUDGET", "7000")))

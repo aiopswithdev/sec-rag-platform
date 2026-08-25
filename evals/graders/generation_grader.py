@@ -5,12 +5,14 @@ from pydantic import BaseModel, Field
 import instructor
 from groq import Groq
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from src.common.rate_limiter import grader_limiter
 
 logger = logging.getLogger("GenerationGrader")
 
 # compiled_context is already bounded by synthesis's own TOTAL_TOKEN_CEILING (~5000 tokens,
 # ~20k chars worst case) — this is a generous backstop, not a real truncation point.
-MAX_JUDGE_CONTEXT_CHARS = int(os.getenv("JUDGE_CONTEXT_CHARS", "20000"))
+MAX_JUDGE_CONTEXT_CHARS = int(os.getenv("JUDGE_CONTEXT_CHARS", "10000"))
+GRADER_MAX_COMPLETION_TOKENS = int(os.getenv("GRADER_MAX_COMPLETION_TOKENS", "3072"))  # was 1024
 _judge_client = instructor.from_groq(Groq(), mode=instructor.Mode.JSON)
 
 class FactEvaluation(BaseModel):
@@ -31,13 +33,13 @@ def _call_judge_with_backoff(client, prompt: str, system_prompt: str):
     return client.chat.completions.create(
         model="qwen/qwen3.6-27b",
         response_model=AnswerEvaluation,
+        max_tokens=GRADER_MAX_COMPLETION_TOKENS,   # bound output — prevents mid-JSON truncation on large context_str
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ],
         temperature=0.0
     )
-
 
 def grade_generation(answer: str, expected_facts: List[Dict], compiled_context: str) -> Dict[str, float]:
     if not expected_facts:
@@ -66,6 +68,9 @@ def grade_generation(answer: str, expected_facts: List[Dict], compiled_context: 
     )
 
     try:
+        # in grade_generation, right before calling _call_judge_with_backoff
+        estimated = (len(system_prompt) + len(prompt)) // 4 + GRADER_MAX_COMPLETION_TOKENS
+        grader_limiter.acquire(estimated)
         eval_result: AnswerEvaluation = _call_judge_with_backoff(_judge_client, prompt, system_prompt)
         results = eval_result.evaluations
         if not results:

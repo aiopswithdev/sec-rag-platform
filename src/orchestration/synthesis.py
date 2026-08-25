@@ -13,7 +13,7 @@ _synthesis_client = Groq()
 
 TOTAL_TOKEN_CEILING = int(os.getenv("SYNTHESIS_TOKEN_CEILING", "5000"))
 SAFETY_MARGIN = int(os.getenv("SYNTHESIS_SAFETY_MARGIN", "1800"))
-MAX_COMPLETION_TOKENS = int(os.getenv("SYNTHESIS_MAX_COMPLETION_TOKENS", "900"))
+MAX_COMPLETION_TOKENS = int(os.getenv("SYNTHESIS_MAX_COMPLETION_TOKENS", "1400"))
 MAX_BLOCK_SHARE = float(os.getenv("SYNTHESIS_MAX_BLOCK_SHARE", "0.45"))
 REFUSAL_PHRASE = "I do not have sufficient data in the retrieved filings"
 
