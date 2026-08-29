@@ -16,12 +16,31 @@ logger = logging.getLogger("PlannerNode")
 _planner_client = instructor.from_groq(Groq(), mode=instructor.Mode.TOOLS)
 
 class ExtractedSubQuery(BaseModel):
-    query: str = Field(description="Focused search query string.")
+    query: str = Field(
+        default="",
+        description="Free-text search string — ONLY used when query_category is 'OTHER' "
+                    "(e.g. a specific risk topic like cybersecurity or supply chain). Ignored for every other category."
+    )
+    query_category: Literal["TOTAL_METRIC", "GEO_NUMBERS", "GEO_DRIVERS", "TAX_RATE", "OTHER"] = Field(
+        description="'TOTAL_METRIC' for a single company-wide revenue/sales figure. "
+                    "'GEO_NUMBERS' for geographic segment dollar figures. "
+                    "'GEO_DRIVERS' for geographic segment growth explanations. "
+                    "'TAX_RATE' for effective tax rate / tax provision questions. "
+                    "'OTHER' for anything else (e.g. risk factors) — in which case 'query' must contain a focused free-text search string."
+    )
     ticker: Optional[str] = Field(default=None, description="Exact ticker string from inventory, e.g., 'AAPL', 'MSFT'.")
     fiscal_year: Optional[int] = Field(default=None, description="Exact fiscal year integer from inventory, e.g., 2023, 2024.")
     item_number: Optional[Literal["Item 1A", "Item 7", "Item 8"]] = Field(
         default=None, description="Must be strictly one of 'Item 1A', 'Item 7', or 'Item 8'."
     )
+
+# Resolved by code, never retyped by the model — this is the fix.
+CANONICAL_QUERIES = {
+    "TOTAL_METRIC": "total net sales total revenue consolidated statements of operations",
+    "GEO_NUMBERS": "United States International Americas Europe Greater China geographic segment net sales revenue",
+    "GEO_DRIVERS": "reasons drivers factors for segment revenue growth decline foreign currency impact",
+    "TAX_RATE": "effective tax rate reconciliation federal statutory rate provision for income taxes income tax expense",
+}
 
 class QueryPlan(BaseModel):
     reasoning: str = Field(description="Brief plan justification. Use single quotes only, never double quotes.")
@@ -147,36 +166,41 @@ def plan_queries(state: dict) -> dict:
     "Example 1 (Multi-Entity Geographic Comparison):\n"
     "User Prompt: 'Look at the geographic segment performance for both Apple and Microsoft in 2024.'\n"
     "Output: {\n"
-    "  \"reasoning\": \"Decomposing geographic query into an Item 7 drivers sub-query and an Item 8 numbers sub-query per ticker.\",\n"
+    "  \"reasoning\": \"One GEO_DRIVERS sub-query (Item 7) and one GEO_NUMBERS sub-query (Item 8) per ticker.\",\n"
     "  \"sub_queries\": [\n"
-    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2024, \"item_number\": \"Item 7\",\n"
-    "     \"query\": \"reasons drivers factors for segment revenue growth decline foreign currency impact\"},\n"
-    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\",\n"
-    "     \"query\": \"United States International Americas Europe Greater China geographic segment net sales revenue\"},\n"
-    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 7\",\n"
-    "     \"query\": \"reasons drivers factors for segment revenue growth decline foreign currency impact\"},\n"
-    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\",\n"
-    "     \"query\": \"United States International Americas Europe Greater China geographic segment net sales revenue\"}\n"
+    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2024, \"item_number\": \"Item 7\", \"query_category\": \"GEO_DRIVERS\", \"query\": \"\"},\n"
+    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\", \"query_category\": \"GEO_NUMBERS\", \"query\": \"\"},\n"
+    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 7\", \"query_category\": \"GEO_DRIVERS\", \"query\": \"\"},\n"
+    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\", \"query_category\": \"GEO_NUMBERS\", \"query\": \"\"}\n"
     "  ]\n"
     "}\n\n"
-    "Example 2 (Accounting Metric Search Expansion):\n"
+
+    "Example 2 (Tax Rate):\n"
     "User Prompt: 'What were the exact effective tax rates for Microsoft in 2023 and 2024?'\n"
     "Output: {\n"
-    "  \"reasoning\": \"Generating isolated sub-queries per year targeting Item 8 with tax footnote search expansion.\",\n"
+    "  \"reasoning\": \"Two isolated TAX_RATE sub-queries, one per fiscal year, targeting Item 8.\",\n"
     "  \"sub_queries\": [\n"
-    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2023, \"item_number\": \"Item 8\",\n"
-    "     \"query\": \"effective tax rate provision for income taxes\"},\n"
-    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\",\n"
-    "     \"query\": \"effective tax rate provision for income taxes\"}\n"
+    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2023, \"item_number\": \"Item 8\", \"query_category\": \"TAX_RATE\", \"query\": \"\"},\n"
+    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 8\", \"query_category\": \"TAX_RATE\", \"query\": \"\"}\n"
     "  ]\n"
     "}\n\n"
-    "Example 3 (Single Total Metric — do NOT decompose or add Item 7):\n"
+
+    "Example 3 (Single Total Metric):\n"
     "User Prompt: 'Extract Apple total net sales exactly as reported in their 2023 financial statements.'\n"
     "Output: {\n"
-    "  \"reasoning\": \"Single company-wide metric for one ticker-year. One Item 8 sub-query only, no geographic expansion.\",\n"
+    "  \"reasoning\": \"Single company-wide metric — one TOTAL_METRIC sub-query, Item 8 only.\",\n"
     "  \"sub_queries\": [\n"
-    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2023, \"item_number\": \"Item 8\",\n"
-    "     \"query\": \"total net sales total revenue consolidated statements of operations\"}\n"
+    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2023, \"item_number\": \"Item 8\", \"query_category\": \"TOTAL_METRIC\", \"query\": \"\"}\n"
+    "  ]\n"
+    "}\n\n"
+
+    "Example 4 (Risk Factors — free text, since the topic varies):\n"
+    "User Prompt: 'Compare cybersecurity risk factors for Apple and Microsoft in 2024.'\n"
+    "Output: {\n"
+    "  \"reasoning\": \"Risk topic varies per question, so query_category is OTHER with a focused free-text string.\",\n"
+    "  \"sub_queries\": [\n"
+    "    {\"ticker\": \"AAPL\", \"fiscal_year\": 2024, \"item_number\": \"Item 1A\", \"query_category\": \"OTHER\", \"query\": \"cybersecurity risk factors\"},\n"
+    "    {\"ticker\": \"MSFT\", \"fiscal_year\": 2024, \"item_number\": \"Item 1A\", \"query_category\": \"OTHER\", \"query\": \"cybersecurity risk factors\"}\n"
     "  ]\n"
     "}"
     )
@@ -221,7 +245,8 @@ def plan_queries(state: dict) -> dict:
     for sq in plan.sub_queries:
         if (sq.ticker, sq.fiscal_year) in valid_inventory:
             sq_dict = sq.model_dump()
-            sq_dict["query"] = sq_dict["query"].strip(" '\"")  # strip stray quote chars the model sometimes echoes
+            canonical = CANONICAL_QUERIES.get(sq.query_category)
+            sq_dict["query"] = canonical if canonical else sq_dict["query"].strip(" '\"")
             validated_queries.append(sq_dict)
         else:
             logger.warning(f"Tuple Guard dropped out-of-bounds query: {sq.ticker} FY{sq.fiscal_year}")
