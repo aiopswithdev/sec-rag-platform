@@ -5,6 +5,11 @@ import uuid
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from qdrant_client import AsyncQdrantClient
@@ -16,11 +21,6 @@ from src.retrieval.models import QueryRequest, RetrievedContext, AskRequest, Orc
 from src.retrieval.core import execute_core_retrieval
 from src.orchestration.graph import orchestrator_app
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 

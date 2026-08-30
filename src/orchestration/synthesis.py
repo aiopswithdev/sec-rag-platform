@@ -5,6 +5,9 @@ import tiktoken
 from collections import defaultdict
 from groq import Groq
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.common.rate_limiter import synthesis_limiter
 
 logger = logging.getLogger("SynthesisNode")
