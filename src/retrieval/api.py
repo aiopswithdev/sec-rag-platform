@@ -10,7 +10,8 @@ try:
     load_dotenv()
 except ImportError:
     pass
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, status, Depends
+from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse
 from qdrant_client import AsyncQdrantClient
 from fastembed import TextEmbedding, SparseTextEmbedding
@@ -23,6 +24,15 @@ from src.orchestration.graph import orchestrator_app
 
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+API_KEY = os.getenv("API_KEY")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def require_api_key(key: str = Security(_api_key_header)):
+    if not API_KEY:
+        raise RuntimeError("API_KEY is not set — refusing to serve requests with auth disabled.")
+    if key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key.")
 
 class Infrastructure:
     qdrant: AsyncQdrantClient = None
@@ -62,7 +72,7 @@ async def _local_retriever(payload: dict) -> list[dict]:
     """Adapter: executor payload dict -> in-process core retrieval."""
     return await execute_core_retrieval(QueryRequest(**payload), infra)
 
-@app.post("/retrieve", response_model=list[RetrievedContext])
+@app.post("/retrieve", response_model=list[RetrievedContext], dependencies=[Depends(require_api_key)])
 async def retrieve_context(request: QueryRequest):
     try:
         return await execute_core_retrieval(request, infra)
@@ -70,7 +80,7 @@ async def retrieve_context(request: QueryRequest):
         logging.error(f"Retrieval Endpoint Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal Server Error during context retrieval.")
 
-@app.post("/ask", response_model=OrchestratedAskResponse)
+@app.post("/ask", response_model=OrchestratedAskResponse, dependencies=[Depends(require_api_key)])
 async def ask_orchestrated(request: AskRequest):
     started = time.perf_counter()
     trace_id = str(uuid.uuid4())
@@ -107,7 +117,7 @@ async def ask_orchestrated(request: AskRequest):
         },
     )
 
-@app.post("/ask/stream")
+@app.post("/ask/stream", dependencies=[Depends(require_api_key)])
 async def ask_stream(request: AskRequest):
     async def gen():
         async for chunk in orchestrator_app.astream(
